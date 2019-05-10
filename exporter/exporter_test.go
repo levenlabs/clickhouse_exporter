@@ -12,7 +12,10 @@ func TestScrape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exporter := NewExporter(*clickhouseUrl, false, "", "")
+	exporter, err := NewExporter(*clickhouseUrl, false, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	t.Run("Describe", func(t *testing.T) {
 		ch := make(chan *prometheus.Desc)

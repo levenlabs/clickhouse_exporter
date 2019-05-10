@@ -6,10 +6,10 @@ import (
 	"net/url"
 	"os"
 
-	"github.com/f1yegor/clickhouse_exporter/exporter"
+	"github.com/levenlabs/clickhouse_exporter/exporter"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/log"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/log"
 )
 
 var (
@@ -28,10 +28,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	e := exporter.NewExporter(*uri, *insecure, user, password)
+	e, err := exporter.NewExporter(*uri, *insecure, user, password)
+	if err != nil {
+		log.Fatal(err)
+	}
 	prometheus.MustRegister(e)
 
-	log.Printf("Starting Server: %s", *listeningAddress)
+	log.Infof("Starting Server: %s", *listeningAddress)
 	http.Handle(*metricsEndpoint, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html>

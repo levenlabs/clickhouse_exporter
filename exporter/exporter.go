@@ -2,17 +2,15 @@ package exporter
 
 import (
 	"crypto/tls"
+	"database/sql"
 	"fmt"
-	"io/ioutil"
-	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
-	"time"
 	"unicode"
 
+	"github.com/mailru/go-clickhouse"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/log"
+	"github.com/prometheus/common/log"
 )
 
 const (
@@ -22,56 +20,44 @@ const (
 // Exporter collects clickhouse stats from the given URI and exports them using
 // the prometheus metrics package.
 type Exporter struct {
-	metricsURI      string
-	asyncMetricsURI string
-	eventsURI       string
-	partsURI        string
-	client          *http.Client
-
+	db             *sql.DB
 	scrapeFailures prometheus.Counter
-
-	user     string
-	password string
 }
 
-// NewExporter returns an initialized Exporter.
-func NewExporter(uri url.URL, insecure bool, user, password string) *Exporter {
-	q := uri.Query()
-	metricsURI := uri
-	q.Set("query", "select metric, value from system.metrics")
-	metricsURI.RawQuery = q.Encode()
+// NewExporter returns an initialized Exporter. The user/password can either be in the
+// uri or sent and they'll be automatically added to the uri.
+func NewExporter(uri url.URL, insecure bool, user, password string) (*Exporter, error) {
+	if uri.User.Username() == "" && user != "" {
+		if password != "" {
+			uri.User = url.UserPassword(user, password)
+		} else {
+			uri.User = url.User(user)
+		}
+	}
 
-	asyncMetricsURI := uri
-	q.Set("query", "select metric, value from system.asynchronous_metrics")
-	asyncMetricsURI.RawQuery = q.Encode()
+	if insecure {
+		clickhouse.RegisterTLSConfig("insecure", &tls.Config{InsecureSkipVerify: insecure})
+		q := uri.Query()
+		q.Set("tls_config", "insecure")
+		uri.RawQuery = q.Encode()
+	}
 
-	eventsURI := uri
-	q.Set("query", "select event, value from system.events")
-	eventsURI.RawQuery = q.Encode()
+	db, err := sql.Open("clickhouse", uri.String())
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		return nil, err
+	}
 
-	partsURI := uri
-	q.Set("query", "select database, table, sum(bytes) as bytes, count() as parts, sum(rows) as rows from system.parts where active = 1 group by database, table")
-	partsURI.RawQuery = q.Encode()
-	
 	return &Exporter{
-		metricsURI:      metricsURI.String(),
-		asyncMetricsURI: asyncMetricsURI.String(),
-		eventsURI:       eventsURI.String(),
-		partsURI:        partsURI.String(),
+		db: db,
 		scrapeFailures: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "exporter_scrape_failures_total",
 			Help:      "Number of errors while scraping clickhouse.",
 		}),
-		client: &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
-			},
-			Timeout: 30 * time.Second,
-		},
-		user:     user,
-		password: password,
-	}
+	}, nil
 }
 
 // Describe describes all the metrics ever exported by the clickhouse exporter. It
@@ -97,24 +83,24 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
-	metrics, err := e.parseKeyValueResponse(e.metricsURI)
+	metrics, err := e.parseKeyValueDescQuery("SELECT metric, value, description FROM system.metrics")
 	if err != nil {
-		return fmt.Errorf("Error scraping clickhouse url %v: %v", e.metricsURI, err)
+		return fmt.Errorf("Error querying system.metrics: %v", err)
 	}
 
 	for _, m := range metrics {
 		newMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      metricName(m.key),
-			Help:      "Number of " + m.key + " currently processed",
+			Help:      m.desc,
 		}, []string{}).WithLabelValues()
 		newMetric.Set(float64(m.value))
 		newMetric.Collect(ch)
 	}
 
-	asyncMetrics, err := e.parseKeyValueResponse(e.asyncMetricsURI)
+	asyncMetrics, err := e.parseAsyncQuery("SELECT metric, value FROM system.asynchronous_metrics")
 	if err != nil {
-		return fmt.Errorf("Error scraping clickhouse url %v: %v", e.asyncMetricsURI, err)
+		return fmt.Errorf("Error querying system.asynchronous_metrics: %v", err)
 	}
 
 	for _, am := range asyncMetrics {
@@ -127,23 +113,25 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
 		newMetric.Collect(ch)
 	}
 
-	events, err := e.parseKeyValueResponse(e.eventsURI)
+	events, err := e.parseKeyValueDescQuery("SELECT event, value, description FROM system.events")
 	if err != nil {
-		return fmt.Errorf("Error scraping clickhouse url %v: %v", e.eventsURI, err)
+		return fmt.Errorf("Error querying system.events: %v", err)
 	}
 
 	for _, ev := range events {
-		newMetric, _ := prometheus.NewConstMetric(
-			prometheus.NewDesc(
-				namespace+"_"+metricName(ev.key)+"_total",
-				"Number of "+ev.key+" total processed", []string{}, nil),
+		newMetric, err := prometheus.NewConstMetric(
+			prometheus.NewDesc(namespace+"_"+metricName(ev.key)+"_total", ev.desc, []string{}, nil),
 			prometheus.CounterValue, float64(ev.value))
+		if err != nil {
+			return fmt.Errorf("Error calling NewConstMetric: %v", err)
+		}
 		ch <- newMetric
 	}
 
-	parts, err := e.parsePartsResponse(e.partsURI)
+	parts, err := e.parsePartsQuery(`SELECT database, table, sum(bytes) AS bytes, count() as parts, sum(rows) AS rows
+		FROM system.parts WHERE active GROUP BY database, table`)
 	if err != nil {
-		return fmt.Errorf("Error scraping clickhouse url %v: %v", e.partsURI, err)
+		return fmt.Errorf("Error querying system.parts: %v", err)
 	}
 
 	for _, part := range parts {
@@ -172,65 +160,94 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
 		newRowsMetric.Collect(ch)
 	}
 
+	replicas, err := e.parseReplicasQuery(`SELECT database, table, replica_name, queue_size, absolute_delay, total_replicas, active_replicas
+	 FROM system.replicas`)
+	if err != nil {
+		return fmt.Errorf("Error querying system.replicas: %v", err)
+	}
+
+	for _, repl := range replicas {
+		newSizeMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replica_queue_size",
+			Help:      "Number of queue entries to execute",
+		}, []string{"database", "table", "name"}).WithLabelValues(repl.database, repl.table, repl.name)
+		newSizeMetric.Set(float64(repl.size))
+		newSizeMetric.Collect(ch)
+
+		newDelayMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replica_absolute_delay",
+			Help:      "Number of seconds that the replica is behind the current time",
+		}, []string{"database", "table", "name"}).WithLabelValues(repl.database, repl.table, repl.name)
+		newDelayMetric.Set(float64(repl.delay))
+		newDelayMetric.Collect(ch)
+
+		newTotalMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replica_total_replicas",
+			Help:      "Total number of replicas",
+		}, []string{"database", "table", "name"}).WithLabelValues(repl.database, repl.table, repl.name)
+		newTotalMetric.Set(float64(repl.total))
+		newTotalMetric.Collect(ch)
+
+		newActiveMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replica_active_replicas",
+			Help:      "Number of active replicas",
+		}, []string{"database", "table", "name"}).WithLabelValues(repl.database, repl.table, repl.name)
+		newActiveMetric.Set(float64(repl.active))
+		newActiveMetric.Collect(ch)
+	}
+
 	return nil
 }
 
-func (e *Exporter) handleResponse(uri string) ([]byte, error) {
-	req, err := http.NewRequest("GET", uri, nil)
-	if err != nil {
-		return nil, err
-	}
-	if e.user != "" && e.password != "" {
-		req.Header.Set("X-ClickHouse-User", e.user)
-		req.Header.Set("X-ClickHouse-Key", e.password)
-	}
-	resp, err := e.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("Error scraping clickhouse: %v", err)
-	}
-	defer resp.Body.Close()
-
-	data, err := ioutil.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		if err != nil {
-			data = []byte(err.Error())
-		}
-		return nil, fmt.Errorf("Status %s (%d): %s", resp.Status, resp.StatusCode, data)
-	}
-	
-	return data, nil
-}
-
-type lineResult struct {
+type keyValResult struct {
 	key   string
-	value int
+	value int64
+	desc  string
 }
 
-func (e *Exporter) parseKeyValueResponse(uri string) ([]lineResult, error) {
-	data, err := e.handleResponse(uri)
+func (e *Exporter) parseKeyValueDescQuery(query string) ([]keyValResult, error) {
+	rows, err := e.db.Query(query)
 	if err != nil {
 		return nil, err
 	}
-
-	// Parsing results
-	lines := strings.Split(string(data), "\n")
-	var results []lineResult = make([]lineResult, 0)
-
-	for i, line := range lines {
-		parts := strings.Fields(line)
-		if len(parts) == 0 {
-			continue
-		}
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("parseKeyValueResponse: unexpected %d line: %s", i, line)
-		}
-		k := strings.TrimSpace(parts[0])
-		v, err := strconv.Atoi(strings.TrimSpace(parts[1]))
-		if err != nil {
+	var results []keyValResult
+	for rows.Next() {
+		var l keyValResult
+		if err := rows.Scan(&l.key, &l.value, &l.desc); err != nil {
 			return nil, err
 		}
-		results = append(results, lineResult{k, v})
+		results = append(results, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
 
+type asyncResult struct {
+	key   string
+	value float64
+}
+
+func (e *Exporter) parseAsyncQuery(query string) ([]asyncResult, error) {
+	rows, err := e.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	var results []asyncResult
+	for rows.Next() {
+		var l asyncResult
+		if err := rows.Scan(&l.key, &l.value); err != nil {
+			return nil, err
+		}
+		results = append(results, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return results, nil
 }
@@ -238,50 +255,56 @@ func (e *Exporter) parseKeyValueResponse(uri string) ([]lineResult, error) {
 type partsResult struct {
 	database string
 	table    string
-	bytes    int
-	parts    int
-	rows     int
+	bytes    int64
+	parts    int64
+	rows     int64
 }
 
-func (e *Exporter) parsePartsResponse(uri string) ([]partsResult, error) {
-	data, err := e.handleResponse(uri)
+func (e *Exporter) parsePartsQuery(query string) ([]partsResult, error) {
+	rows, err := e.db.Query(query)
 	if err != nil {
 		return nil, err
 	}
-
-	// Parsing results
-	lines := strings.Split(string(data), "\n")
-	var results []partsResult = make([]partsResult, 0)
-
-	for i, line := range lines {
-		parts := strings.Fields(line)
-		if len(parts) == 0 {
-			continue
-		}
-		if len(parts) != 5 {
-			return nil, fmt.Errorf("parsePartsResponse: unexpected %d line: %s", i, line)
-		}
-		database := strings.TrimSpace(parts[0])
-		table := strings.TrimSpace(parts[1])
-
-		bytes, err := strconv.Atoi(strings.TrimSpace(parts[2]))
-		if err != nil {
+	var results []partsResult
+	for rows.Next() {
+		var p partsResult
+		if err := rows.Scan(&p.database, &p.table, &p.bytes, &p.parts, &p.rows); err != nil {
 			return nil, err
 		}
-
-		count, err := strconv.Atoi(strings.TrimSpace(parts[3]))
-		if err != nil {
-			return nil, err
-		}
-
-		rows, err := strconv.Atoi(strings.TrimSpace(parts[4]))
-		if err != nil {
-			return nil, err
-		}
-
-		results = append(results, partsResult{database, table, bytes, count, rows})
+		results = append(results, p)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
 
+type replicaResult struct {
+	database string
+	table    string
+	name     string
+	size     int64
+	delay    int64
+	total    int64
+	active   int64
+}
+
+func (e *Exporter) parseReplicasQuery(query string) ([]replicaResult, error) {
+	rows, err := e.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	var results []replicaResult
+	for rows.Next() {
+		var r replicaResult
+		if err := rows.Scan(&r.database, &r.table, &r.name, &r.size, &r.delay, &r.total, &r.active); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return results, nil
 }
 
@@ -289,7 +312,7 @@ func (e *Exporter) parsePartsResponse(uri string) ([]partsResult, error) {
 // as Prometheus metrics. It implements prometheus.Collector.
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	if err := e.collect(ch); err != nil {
-		log.Printf("Error scraping clickhouse: %s", err)
+		log.Errorf("Error scraping clickhouse: %s", err)
 		e.scrapeFailures.Inc()
 		e.scrapeFailures.Collect(ch)
 	}
