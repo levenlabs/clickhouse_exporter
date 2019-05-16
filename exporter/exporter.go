@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/mailru/go-clickhouse"
@@ -128,7 +129,7 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
 		ch <- newMetric
 	}
 
-	parts, err := e.parsePartsQuery(`SELECT database, table, sum(bytes) AS bytes, count() as parts, sum(rows) AS rows
+	parts, err := e.parsePartsQuery(`SELECT database, table, sum(bytes) AS bytes, count() as parts, sum(rows) AS rows, max(max_date) as max_date, max(max_time) as max_time
 		FROM system.parts WHERE active GROUP BY database, table`)
 	if err != nil {
 		return fmt.Errorf("Error querying system.parts: %v", err)
@@ -158,6 +159,21 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
 		}, []string{"database", "table"}).WithLabelValues(part.database, part.table)
 		newRowsMetric.Set(float64(part.rows))
 		newRowsMetric.Collect(ch)
+
+		// use either max_date or max_time
+		t := part.maxDate
+		if part.maxTime.After(t) {
+			t = part.maxTime
+		}
+		if !t.IsZero() {
+			newTimeMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "table_parts_max_time",
+				Help:      "Maximum value of the date/time key in the table as a unix timestamp",
+			}, []string{"database", "table"}).WithLabelValues(part.database, part.table)
+			newTimeMetric.Set(float64(t.Unix()))
+			newTimeMetric.Collect(ch)
+		}
 	}
 
 	replicas, err := e.parseReplicasQuery(`SELECT database, table, replica_name, queue_size, absolute_delay, total_replicas, active_replicas
@@ -258,6 +274,8 @@ type partsResult struct {
 	bytes    int64
 	parts    int64
 	rows     int64
+	maxDate  time.Time
+	maxTime  time.Time
 }
 
 func (e *Exporter) parsePartsQuery(query string) ([]partsResult, error) {
@@ -268,7 +286,7 @@ func (e *Exporter) parsePartsQuery(query string) ([]partsResult, error) {
 	var results []partsResult
 	for rows.Next() {
 		var p partsResult
-		if err := rows.Scan(&p.database, &p.table, &p.bytes, &p.parts, &p.rows); err != nil {
+		if err := rows.Scan(&p.database, &p.table, &p.bytes, &p.parts, &p.rows, &p.maxDate, &p.maxTime); err != nil {
 			return nil, err
 		}
 		results = append(results, p)
