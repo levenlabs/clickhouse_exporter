@@ -176,7 +176,8 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
 		}
 	}
 
-	replicas, err := e.parseReplicasQuery(`SELECT database, table, replica_name, queue_size, absolute_delay, total_replicas, active_replicas
+	replicas, err := e.parseReplicasQuery(`SELECT database, table, replica_name, queue_size, absolute_delay,
+	 total_replicas, active_replicas, future_parts, parts_to_check, inserts_in_queue, merges_in_queue
 	 FROM system.replicas`)
 	if err != nil {
 		return fmt.Errorf("Error querying system.replicas: %v", err)
@@ -214,6 +215,114 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
 		}, []string{"database", "table", "name"}).WithLabelValues(repl.database, repl.table, repl.name)
 		newActiveMetric.Set(float64(repl.active))
 		newActiveMetric.Collect(ch)
+
+		newFuturePartsMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replica_future_parts",
+			Help:      "Number of data parts that will appear as the result of INSERTs or merges that haven't been done yet",
+		}, []string{"database", "table", "name"}).WithLabelValues(repl.database, repl.table, repl.name)
+		newFuturePartsMetric.Set(float64(repl.futureParts))
+		newFuturePartsMetric.Collect(ch)
+
+		newPartsToCheckMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replica_parts_to_check",
+			Help:      "Number of data parts in the queue for verification",
+		}, []string{"database", "table", "name"}).WithLabelValues(repl.database, repl.table, repl.name)
+		newPartsToCheckMetric.Set(float64(repl.partsToCheck))
+		newPartsToCheckMetric.Collect(ch)
+
+		newInsertsInQueueMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replica_inserts_in_queue",
+			Help:      "Number of insert blocks of data that need to be made",
+		}, []string{"database", "table", "name"}).WithLabelValues(repl.database, repl.table, repl.name)
+		newInsertsInQueueMetric.Set(float64(repl.insertsInQueue))
+		newInsertsInQueueMetric.Collect(ch)
+
+		newMergesInQueueMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replica_merges_in_queue",
+			Help:      "Number of merges waiting to be made",
+		}, []string{"database", "table", "name"}).WithLabelValues(repl.database, repl.table, repl.name)
+		newMergesInQueueMetric.Set(float64(repl.mergesInQueue))
+		newMergesInQueueMetric.Collect(ch)
+
+	}
+
+	mutations, err := e.parseMutationsResponse(`SELECT database, table, count() as mutations, sum(parts_to_do) as parts_to_do
+		FROM system.mutations WHERE is_done = 0
+		GROUP BY database, table`)
+	if err != nil {
+		return fmt.Errorf("Error querying system.mutations: %v", err)
+	}
+
+	for _, mut := range mutations {
+		newCountMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "table_mutations_count",
+			Help:      "Number of mutations pending for the table",
+		}, []string{"database", "table"}).WithLabelValues(mut.database, mut.table)
+		newCountMetric.Set(float64(mut.mutations))
+		newCountMetric.Collect(ch)
+
+		newPartsMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "table_mutations_parts",
+			Help:      "Number of pending mutation parts to do of the table",
+		}, []string{"database", "table"}).WithLabelValues(mut.database, mut.table)
+		newPartsMetric.Set(float64(mut.partsToDo))
+		newPartsMetric.Collect(ch)
+	}
+
+	processes, err := e.parseProcessesResponse(`SELECT count() as processes, sum(memory_usage) as memory_usage,
+		sum(peak_memory_usage) as peak_memory_usage, sum(elapsed) as elapsed, sum(read_rows) as read_rows
+		FROM system.processes
+		WHERE query NOT LIKE '%FROM system.%'`)
+	if err != nil {
+		return fmt.Errorf("Error querying system.processes: %v", err)
+	}
+
+	for _, proc := range processes {
+		newCountMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "processes_count",
+			Help:      "Number of ongoing processes",
+		}, []string{}).WithLabelValues()
+		newCountMetric.Set(float64(proc.processes))
+		newCountMetric.Collect(ch)
+
+		newMemoryMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "processes_memory_usage_bytes",
+			Help:      "Total memory usage of all ongoing processes",
+		}, []string{}).WithLabelValues()
+		newMemoryMetric.Set(float64(proc.memoryUsage))
+		newMemoryMetric.Collect(ch)
+
+		newPeakMemoryMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "processes_peak_memory_usage_bytes",
+			Help:      "Total memory usage of all ongoing processes",
+		}, []string{}).WithLabelValues()
+		newPeakMemoryMetric.Set(float64(proc.peakMemoryUsage))
+		newPeakMemoryMetric.Collect(ch)
+
+		newElapsedMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "processes_elapsed_seconds",
+			Help:      "Total elapsed time of all ongoing processes",
+		}, []string{}).WithLabelValues()
+		newElapsedMetric.Set(proc.elapsed)
+		newElapsedMetric.Collect(ch)
+
+		newRowsMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "processes_read_rows",
+			Help:      "Total amount of rows read so far by all ongoing processes",
+		}, []string{}).WithLabelValues()
+		newRowsMetric.Set(float64(proc.readRows))
+		newRowsMetric.Collect(ch)
 	}
 
 	return nil
@@ -298,13 +407,17 @@ func (e *Exporter) parsePartsQuery(query string) ([]partsResult, error) {
 }
 
 type replicaResult struct {
-	database string
-	table    string
-	name     string
-	size     int64
-	delay    int64
-	total    int64
-	active   int64
+	database       string
+	table          string
+	name           string
+	size           int64
+	delay          int64
+	total          int64
+	active         int64
+	futureParts    int64
+	partsToCheck   int64
+	insertsInQueue int64
+	mergesInQueue  int64
 }
 
 func (e *Exporter) parseReplicasQuery(query string) ([]replicaResult, error) {
@@ -315,7 +428,61 @@ func (e *Exporter) parseReplicasQuery(query string) ([]replicaResult, error) {
 	var results []replicaResult
 	for rows.Next() {
 		var r replicaResult
-		if err := rows.Scan(&r.database, &r.table, &r.name, &r.size, &r.delay, &r.total, &r.active); err != nil {
+		if err := rows.Scan(&r.database, &r.table, &r.name, &r.size, &r.delay, &r.total, &r.active,
+			&r.futureParts, &r.partsToCheck, &r.insertsInQueue, &r.mergesInQueue); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+type mutationsResult struct {
+	database  string
+	table     string
+	mutations int64
+	partsToDo int64
+}
+
+func (e *Exporter) parseMutationsResponse(query string) ([]mutationsResult, error) {
+	rows, err := e.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	var results []mutationsResult
+	for rows.Next() {
+		var r mutationsResult
+		if err := rows.Scan(&r.database, &r.table, &r.mutations, &r.partsToDo); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+type processesResult struct {
+	processes       int64
+	memoryUsage     int64
+	peakMemoryUsage int64
+	elapsed         float64
+	readRows        int64
+}
+
+func (e *Exporter) parseProcessesResponse(query string) ([]processesResult, error) {
+	rows, err := e.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	var results []processesResult
+	for rows.Next() {
+		var r processesResult
+		if err := rows.Scan(&r.processes, &r.memoryUsage, &r.peakMemoryUsage, &r.elapsed, &r.readRows); err != nil {
 			return nil, err
 		}
 		results = append(results, r)
