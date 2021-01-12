@@ -129,50 +129,60 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
 		ch <- newMetric
 	}
 
-	parts, err := e.parsePartsQuery(`SELECT database, table, sum(bytes) AS bytes, count() as parts, sum(rows) AS rows, max(max_date) as max_date, max(max_time) as max_time
-		FROM system.parts WHERE active GROUP BY database, table`)
+	parts, err := e.parsePartsQuery(`SELECT database, table, active, sum(bytes) AS bytes, count() as parts, sum(rows) AS rows, max(max_date) as max_date, max(max_time) as max_time
+		FROM system.parts GROUP BY database, table, active`)
 	if err != nil {
 		return fmt.Errorf("Error querying system.parts: %v", err)
 	}
 
 	for _, part := range parts {
-		newBytesMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "table_parts_bytes",
-			Help:      "Table size in bytes",
-		}, []string{"database", "table"}).WithLabelValues(part.database, part.table)
-		newBytesMetric.Set(float64(part.bytes))
-		newBytesMetric.Collect(ch)
-
-		newCountMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "table_parts_count",
-			Help:      "Number of parts of the table",
-		}, []string{"database", "table"}).WithLabelValues(part.database, part.table)
-		newCountMetric.Set(float64(part.parts))
-		newCountMetric.Collect(ch)
-
-		newRowsMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "table_parts_rows",
-			Help:      "Number of rows in the table",
-		}, []string{"database", "table"}).WithLabelValues(part.database, part.table)
-		newRowsMetric.Set(float64(part.rows))
-		newRowsMetric.Collect(ch)
-
-		// use either max_date or max_time
-		t := part.maxDate
-		if part.maxTime.After(t) {
-			t = part.maxTime
-		}
-		if !t.IsZero() {
-			newTimeMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		if part.active == 1 {
+			newBytesMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 				Namespace: namespace,
-				Name:      "table_parts_max_time",
-				Help:      "Maximum value of the date/time key in the table as a unix timestamp",
+				Name:      "table_parts_bytes",
+				Help:      "Table size in bytes",
 			}, []string{"database", "table"}).WithLabelValues(part.database, part.table)
-			newTimeMetric.Set(float64(t.Unix()))
-			newTimeMetric.Collect(ch)
+			newBytesMetric.Set(float64(part.bytes))
+			newBytesMetric.Collect(ch)
+
+			newCountMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "table_parts_count",
+				Help:      "Number of active parts of the table",
+			}, []string{"database", "table"}).WithLabelValues(part.database, part.table)
+			newCountMetric.Set(float64(part.parts))
+			newCountMetric.Collect(ch)
+
+			newRowsMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "table_parts_rows",
+				Help:      "Number of rows in the table",
+			}, []string{"database", "table"}).WithLabelValues(part.database, part.table)
+			newRowsMetric.Set(float64(part.rows))
+			newRowsMetric.Collect(ch)
+
+			// use either max_date or max_time
+			t := part.maxDate
+			if part.maxTime.After(t) {
+				t = part.maxTime
+			}
+			if !t.IsZero() {
+				newTimeMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+					Namespace: namespace,
+					Name:      "table_parts_max_time",
+					Help:      "Maximum value of the date/time key in the table as a unix timestamp",
+				}, []string{"database", "table"}).WithLabelValues(part.database, part.table)
+				newTimeMetric.Set(float64(t.Unix()))
+				newTimeMetric.Collect(ch)
+			}
+		} else {
+			newCountMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "table_inactive_parts_count",
+				Help:      "Number of inactive parts of the table",
+			}, []string{"database", "table"}).WithLabelValues(part.database, part.table)
+			newCountMetric.Set(float64(part.parts))
+			newCountMetric.Collect(ch)
 		}
 	}
 
@@ -380,6 +390,7 @@ func (e *Exporter) parseAsyncQuery(query string) ([]asyncResult, error) {
 type partsResult struct {
 	database string
 	table    string
+	active   int
 	bytes    int64
 	parts    int64
 	rows     int64
@@ -395,7 +406,7 @@ func (e *Exporter) parsePartsQuery(query string) ([]partsResult, error) {
 	var results []partsResult
 	for rows.Next() {
 		var p partsResult
-		if err := rows.Scan(&p.database, &p.table, &p.bytes, &p.parts, &p.rows, &p.maxDate, &p.maxTime); err != nil {
+		if err := rows.Scan(&p.database, &p.table, &p.active, &p.bytes, &p.parts, &p.rows, &p.maxDate, &p.maxTime); err != nil {
 			return nil, err
 		}
 		results = append(results, p)
